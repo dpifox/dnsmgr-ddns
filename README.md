@@ -1,5 +1,5 @@
 # dnsmgr-ddns
-基于彩虹聚合DNS来DDNS的脚本
+基于彩虹聚合DNS的DDNS脚本
 
 建议开一个子用户给单独的域名权限来DDNS
 
