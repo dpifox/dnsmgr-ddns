@@ -1,5 +1,19 @@
 # dnsmgr-ddns
 基于彩虹聚合DNS来DDNS的脚本
+
+我是放在/root/dnsmgr-ddns.sh
+
+赋予脚本权限：`chmod +x /root/dnsmgr-ddns.sh`
+
+需要jq：`apt install jq -y`
+
+`bash dnsmgr-ddns.sh`测试运行
+
+添加定时任务：`crontab -e`
+
+`*/5 * * * * /root/cf-ddns.sh >> /var/log/cf-ddns.log 2>&1`
+
+以下是脚本
 ```
 #!/usr/bin/env bash
 # 测试可用于彩虹聚合dns V2.11 (Build 1042) AI生成
