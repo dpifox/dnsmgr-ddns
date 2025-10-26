@@ -1,7 +1,7 @@
 # dnsmgr-ddns
 基于彩虹聚合DNS来DDNS的脚本
-
-我是放在/root/dnsmgr-ddns.sh
+建议开一个子用户给单独的域名权限来DDNS
+放在/root/dnsmgr-ddns.sh
 
 赋予脚本权限：`chmod +x /root/dnsmgr-ddns.sh`
 
@@ -11,7 +11,7 @@
 
 添加定时任务：`crontab -e`
 
-`*/5 * * * * /root/cf-ddns.sh >> /var/log/cf-ddns.log 2>&1`
+`*/5 * * * * /root/dnsmgr-ddns.sh >> /var/log/cf-ddns.log 2>&1`
 
 以下是脚本
 ```
