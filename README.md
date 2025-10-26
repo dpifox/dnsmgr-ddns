@@ -1,6 +1,8 @@
 # dnsmgr-ddns
 基于彩虹聚合DNS来DDNS的脚本
+
 建议开一个子用户给单独的域名权限来DDNS
+
 放在/root/dnsmgr-ddns.sh
 
 赋予脚本权限：`chmod +x /root/dnsmgr-ddns.sh`
