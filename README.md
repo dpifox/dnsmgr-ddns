@@ -13,7 +13,7 @@
 
 添加定时任务：`crontab -e`
 
-`*/5 * * * * /root/dnsmgr-ddns.sh >> /var/log/cf-ddns.log 2>&1`
+`*/5 * * * * /root/dnsmgr-ddns.sh >> /var/log/dnsmgr-ddns.log 2>&1`
 
 以下是脚本
 ```
