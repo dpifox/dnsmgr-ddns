@@ -20,56 +20,39 @@
 以下是脚本
 ```
 #!/usr/bin/env bash
-# 测试可用于彩虹聚合dns V2.11 (Build 1042) AI生成
-
 set -euo pipefail
 
+########################################
 # 需修改的配置
-API_BASE="https://dns.example.com"  # API地址（末尾不要斜杠）
-USER_ID="用户ID"
-API_KEY="API密钥"
+########################################
+API_BASE="https://dns.example.com"   # API地址（末尾不要斜杠）
+USER_ID="用户ID"                     # 必填：用于请求参数 uid
+API_KEY="API密钥"                    # 必填：用于签名 sign
 DDNS_FQDN="ddns.example.com"         # 要DDNS的域名
+LINE_ID="default"               # 线路ID/线路名称（如果不知道是什么可以先在彩虹上添加解析，然后看本站日志 线路 是什么）
 TTL=600                              # TTL（会自动不低于平台最小TTL）
-LINE_ID="default"                    # 线路ID
 
-# 开关：是否处理 IPv4(A) / IPv6(AAAA)（true/false）
-ENABLE_IPV4=true
-ENABLE_IPV6=true
+ENABLE_IPV4=true                     # true/false：是否更新 A
+ENABLE_IPV6=true                     # true/false：是否更新 AAAA
 
-# 日志相关（同目录自动生成配置文件，可在配置里改）
-DEFAULT_LOG_MAX_LINES=1000
+LOG_MAX_LINES=1000                   # 日志最多保留行数（不生成 conf 文件）
+LOG_FILE="./dnsmgr-ddns.log"         # 日志文件（相对脚本执行目录）
 
 ########################################
-# 内部变量（无需修改）
+# 依赖检测
 ########################################
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOG_FILE="${DIR}/dnsmgr-ddns.log"
-CONF_FILE="${DIR}/dnsmgr-ddns.log.conf"
-LOCK_DIR="${DIR}/.dnsmgr-ddns.lock"
+need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "缺少依赖：$1" >&2; exit 1; }; }
+need_cmd curl
+need_cmd jq
+need_cmd md5sum
 
-# 运行锁，防并发
-if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
-  echo "检测到已有实例在运行，已退出。" >&2
-  exit 0
-fi
-cleanup() { rmdir "${LOCK_DIR}" >/dev/null 2>&1 || true; }
-trap cleanup EXIT
-
-# 生成/加载日志配置
-if [[ ! -f "${CONF_FILE}" ]]; then
-  {
-    echo "# Auto-generated log config for dnsmgr-ddns.sh"
-    echo "LOG_MAX_LINES=${DEFAULT_LOG_MAX_LINES}"
-  } > "${CONF_FILE}"
-fi
-# shellcheck disable=SC1090
-source "${CONF_FILE}"
-: "${LOG_MAX_LINES:=${DEFAULT_LOG_MAX_LINES}}"
-
+########################################
+# 日志
+########################################
 log() {
   local ts; ts="$(date '+%F %T')"
   printf '[%s] %s\n' "${ts}" "$*" >> "${LOG_FILE}"
-  # 控制日志行数
+
   local lines
   lines=$(wc -l < "${LOG_FILE}" 2>/dev/null || echo 0)
   if [[ "${lines}" -gt "${LOG_MAX_LINES}" ]]; then
@@ -77,13 +60,43 @@ log() {
   fi
 }
 
-# 依赖检测（仅用 jq 解析 JSON；另需 curl 与 md5sum）
-need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "缺少依赖：$1" >&2; exit 1; }; }
-need_cmd curl
-need_cmd jq
-need_cmd md5sum
+########################################
+# 基础工具
+########################################
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
 
-# 签名：md5(user_id+timestamp+key) 小写
+# 归一化IP：处理 ["ip"] / 引号 / IPv6大小写
+normalize_ip() {
+  local s
+  s="$(trim "$1")"
+
+  # JSON 数组形态：["ip"] 或 ["ip","ip2"]，取第一个
+  if [[ "$s" == \[*\] ]]; then
+    s="$(jq -r 'try .[0] catch empty' <<<"$s" 2>/dev/null || true)"
+    s="$(trim "$s")"
+  fi
+
+  # 去掉可能的双引号
+  s="${s%\"}"; s="${s#\"}"
+
+  # IPv6 统一小写（IPv4 不受影响）
+  s="${s,,}"
+
+  printf '%s' "$s"
+}
+
+is_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+is_ipv6() { [[ "$1" == *:* ]]; }
+
+########################################
+# 鉴权 / API
+########################################
+# sign = md5(uid + timestamp + key) 小写
 make_sign() {
   local ts s raw
   ts="$(date +%s)"
@@ -97,44 +110,44 @@ api_post() {
   local path="$1"; shift
   local ts sign
   IFS="|" read -r ts sign < <(make_sign)
+
   local url="${API_BASE}${path}"
   local args=( -sS -X POST "${url}"
                --data-urlencode "uid=${USER_ID}"
                --data-urlencode "timestamp=${ts}"
                --data-urlencode "sign=${sign}" )
+
+  local kv
   for kv in "$@"; do
     args+=( --data-urlencode "${kv}" )
   done
+
   curl "${args[@]}"
 }
 
+########################################
 # 获取公网IP
+########################################
 get_ipv4() { curl -4 -fsS ip.sb 2>/dev/null || true; }
 get_ipv6() { curl -6 -fsS ip.sb 2>/dev/null || true; }
 
-is_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
-is_ipv6() { [[ "$1" == *:* ]]; }
-
-# -------- FQDN 规范化：去尾部点、小写、去首尾空白 --------
-trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+########################################
+# 域名/记录相关
+########################################
 SANITIZED_FQDN="$(trim "${DDNS_FQDN}")"
-SANITIZED_FQDN="${SANITIZED_FQDN%.}"   # 去掉尾部点
-SANITIZED_FQDN="${SANITIZED_FQDN,,}"   # 小写
+SANITIZED_FQDN="${SANITIZED_FQDN%.}"
+SANITIZED_FQDN="${SANITIZED_FQDN,,}"
 
 # 在域名列表里找与 FQDN 匹配的主域（最长后缀匹配）
-# 仅用 jq 将 rows 输出为 "id<TAB>name"；Bash 里做后缀匹配，避免依赖 jq 的 test/endswith 等函数
 find_domain() {
   local fqdn="$1" resp
   resp="$(api_post "/api/domain" "offset=0" "limit=100")" || true
 
-  # 安全地取出 id 和 name；如果 rows 缺失或不是数组，得到空输出
   local lines
   lines="$(jq -r '
     if (type=="object" and has("rows") and (.rows|type)=="array") then
       .rows[] | "\(.id)\t\(.name)"
-    else
-      empty
-    end
+    else empty end
   ' <<< "${resp}" 2>/dev/null || true)"
 
   if [[ -z "${lines}" ]]; then
@@ -147,12 +160,10 @@ find_domain() {
   local id name lc_name
   while IFS=$'\t' read -r id name; do
     [[ -z "$id" || -z "$name" ]] && continue
-    # 规范化 name：小写、去尾点、去首尾空白
     lc_name="$(trim "${name}")"
     lc_name="${lc_name%.}"
     lc_name="${lc_name,,}"
 
-    # 精确匹配或后缀匹配（fqdn == name 或 fqdn 以 ".name" 结尾）
     if [[ "${fqdn}" == "${lc_name}" || "${fqdn}" == *".${lc_name}" ]]; then
       local nlen=${#lc_name}
       if (( nlen > best_len )); then
@@ -179,121 +190,93 @@ get_domain_min_ttl() {
 }
 
 # 查询已有记录（按子域 + 类型过滤）
+# 兼容不同返回结构/字段名
 get_record() {
   local domain_id="$1" sub="$2" rtype="$3" resp
   resp="$(api_post "/api/record/data/${domain_id}" "limit=100" "subdomain=${sub}" "type=${rtype}")" || true
+
   jq -c --arg t "$rtype" '
-    try ( ( .rows // [] ) | map(select(.Type==$t)) | ( .[0] // empty ) ) catch empty
+    def pick_type:  (.Type // .type // "");
+    def pick_value: (.Value // .value // .content // .Content // "");
+    def pick_id:    (.RecordId // .recordid // .id // .Id // "");
+
+    try (
+      ( .rows // .data.rows // .Data.rows // [] )
+      | map(select((pick_type|tostring) == $t))
+      | (.[0] // empty)
+      | {
+          RecordId: (pick_id|tostring),
+          Value: (pick_value|tostring)
+        }
+    ) catch empty
   ' <<< "${resp}"
 }
 
-# 新增记录
 add_record() {
   local domain_id="$1" sub="$2" rtype="$3" value="$4" line="$5" ttl="$6"
-  api_post "/api/record/add/${domain_id}"     "name=${sub}" "type=${rtype}" "value=${value}" "line=${line}" "ttl=${ttl}"
+  api_post "/api/record/add/${domain_id}" \
+    "name=${sub}" "type=${rtype}" "value=${value}" "line=${line}" "ttl=${ttl}"
 }
 
-# 修改记录
 update_record() {
   local domain_id="$1" rid="$2" sub="$3" rtype="$4" value="$5" line="$6" ttl="$7"
-  api_post "/api/record/update/${domain_id}"     "recordid=${rid}" "name=${sub}" "type=${rtype}" "value=${value}" "line=${line}" "ttl=${ttl}"
+  api_post "/api/record/update/${domain_id}" \
+    "recordid=${rid}" "name=${sub}" "type=${rtype}" "value=${value}" "line=${line}" "ttl=${ttl}"
 }
 
 ########################################
-# 主流程
+# 核心逻辑：只在变化时更新，并打印归一化前/后
 ########################################
-log "===== dnsmgr-ddns 启动：${SANITIZED_FQDN} ====="
-log "使用的FQDN（规范化）=${SANITIZED_FQDN}"
-
-# 0) 如果 IPv4 与 IPv6 都关闭则直接退出
-if [[ "${ENABLE_IPV4}" != "true" && "${ENABLE_IPV6}" != "true" ]]; then
-  echo "IPv4 与 IPv6 均被禁用，未进行任何更新。"
-  log "IPv4 与 IPv6 均被禁用，流程结束"
-  exit 0
-fi
-
-# 1) 确定主域 & 子域
-domain_json="$(find_domain "${SANITIZED_FQDN}")"
-if [[ -z "${domain_json}" || "${domain_json}" == "null" ]]; then
-  log "错误：在可管理域名中未找到 ${SANITIZED_FQDN} 对应的主域"
-  echo "未在可管理域名中找到 ${SANITIZED_FQDN} 对应主域，退出（详见日志）。" >&2
-  exit 1
-fi
-
-DOMAIN_ID="$(jq -r '.id'   <<< "${domain_json}")"
-DOMAIN_NAME="$(jq -r '.name' <<< "${domain_json}")"
-
-if [[ -z "${DOMAIN_ID}" || -z "${DOMAIN_NAME}" || "${DOMAIN_NAME}" == "null" ]]; then
-  log "错误：domain_json 解析失败：${domain_json}"
-  echo "主域解析失败（详见日志）。" >&2
-  exit 1
-fi
-
-if [[ "${SANITIZED_FQDN}" == "${DOMAIN_NAME}" ]]; then
-  SUBDOMAIN="@"
-else
-  SUBDOMAIN="${SANITIZED_FQDN%."${DOMAIN_NAME}"}"
-fi
-log "已解析主域：id=${DOMAIN_ID}, name=${DOMAIN_NAME}, sub=${SUBDOMAIN}"
-
-# 2) 确保 TTL 不低于平台最小值
-min_ttl_str="$(get_domain_min_ttl "${DOMAIN_ID}")" || true
-if [[ -n "${min_ttl_str}" && "${min_ttl_str}" =~ ^[0-9]+$ ]]; then
-  if (( TTL < min_ttl_str )); then
-    log "将 TTL 从 ${TTL} 调整为平台最小值 ${min_ttl_str}"
-    TTL="${min_ttl_str}"
-  fi
-fi
-
-# 3) 获取公网 IP（按开关）
-IPV4=""; IPV6=""
-if [[ "${ENABLE_IPV4}" == "true" ]]; then
-  IPV4="$(get_ipv4)"
-  if is_ipv4 "${IPV4}"; then log "检测到 IPv4：${IPV4}"; else IPV4=""; log "未检测到 IPv4"; fi
-else
-  log "已禁用 IPv4 处理，跳过获取"
-fi
-
-if [[ "${ENABLE_IPV6}" == "true" ]]; then
-  IPV6="$(get_ipv6)"
-  if is_ipv6 "${IPV6}"; then log "检测到 IPv6：${IPV6}"; else IPV6=""; log "未检测到 IPv6"; fi
-else
-  log "已禁用 IPv6 处理，跳过获取"
-fi
-
-# 4) 处理 A/AAAA
 do_one_type() {
-  local rtype="$1" ip="$2"
+  local rtype="$1" ip="$2" domain_id="$3" sub="$4"
+
   if [[ -z "${ip}" ]]; then
     log "跳过 ${rtype}：IP 为空"
     return 0
   fi
 
-  local rec_json rid cur_val resp code msg
-  rec_json="$(get_record "${DOMAIN_ID}" "${SUBDOMAIN}" "${rtype}")"
+  local ip_raw ip_norm
+  ip_raw="$(trim "${ip}")"
+  ip_norm="$(normalize_ip "${ip_raw}")"
+
+  local rec_json rid cur_raw cur_norm resp code msg
+  rec_json="$(get_record "${domain_id}" "${sub}" "${rtype}")"
+
   if [[ -n "${rec_json}" && "${rec_json}" != "null" ]]; then
     rid="$(jq -r 'try .RecordId catch empty' <<< "${rec_json}")"
-    cur_val="$(jq -r 'try .Value    catch empty' <<< "${rec_json}")"
-    if [[ -n "${rid}" && -n "${cur_val}" ]]; then
-      if [[ "${cur_val}" == "${ip}" ]]; then
-        log "记录未变化（${rtype} ${SANITIZED_FQDN}=${ip}）"
+    rid="$(trim "${rid}")"
+
+    cur_raw="$(jq -r 'try .Value catch empty' <<< "${rec_json}")"
+    cur_raw="$(trim "${cur_raw}")"
+    cur_norm="$(normalize_ip "${cur_raw}")"
+
+    # 日志：归一化前/后
+    log "${rtype} 当前记录(原始)=${cur_raw}"
+    log "${rtype} 当前记录(归一化)=${cur_norm}"
+    log "${rtype} 本机IP(原始)=${ip_raw}"
+    log "${rtype} 本机IP(归一化)=${ip_norm}"
+
+    if [[ -n "${rid}" && -n "${cur_raw}" ]]; then
+      if [[ "${cur_norm}" == "${ip_norm}" ]]; then
+        log "记录未变化（${rtype} ${SANITIZED_FQDN}=${ip_norm}），不执行更新"
+        return 0
+      fi
+
+      log "更新 ${rtype} ${SANITIZED_FQDN}：${cur_norm} -> ${ip_norm}"
+      resp="$(update_record "${domain_id}" "${rid}" "${sub}" "${rtype}" "${ip_norm}" "${LINE_ID}" "${TTL}")"
+      code="$(jq -r 'try .code catch 0' <<< "${resp}")"
+      msg="$(jq -r 'try .msg  catch empty' <<< "${resp}")"
+      if [[ "${code}" = "0" ]]; then
+        log "更新成功（${rtype}）"
       else
-        log "更新 ${rtype} ${SANITIZED_FQDN}：${cur_val} -> ${ip}"
-        resp="$(update_record "${DOMAIN_ID}" "${rid}" "${SUBDOMAIN}" "${rtype}" "${ip}" "${LINE_ID}" "${TTL}")"
-        code="$(jq -r 'try .code catch 0' <<< "${resp}")"
-        msg="$(jq -r 'try .msg  catch empty' <<< "${resp}")"
-        if [[ "${code}" = "0" ]]; then
-          log "更新成功（${rtype}）"
-        else
-          log "更新失败（${rtype}）：code=${code} msg=${msg} resp=${resp}"
-          echo "更新 ${rtype} 记录失败：${msg:-unknown}" >&2
-          return 1
-        fi
+        log "更新失败（${rtype}）：code=${code} msg=${msg} resp=${resp}"
+        echo "更新 ${rtype} 记录失败：${msg:-unknown}" >&2
+        return 1
       fi
     else
-      # 解析异常：当作不存在处理
-      log "记录解析异常（${rtype}），按不存在处理并尝试新增"
-      resp="$(add_record "${DOMAIN_ID}" "${SUBDOMAIN}" "${rtype}" "${ip}" "${LINE_ID}" "${TTL}")"
+      # 解析异常：当作不存在处理 -> 新增
+      log "记录解析异常（${rtype}）：rec_json=${rec_json}，尝试新增"
+      resp="$(add_record "${domain_id}" "${sub}" "${rtype}" "${ip_norm}" "${LINE_ID}" "${TTL}")"
       code="$(jq -r 'try .code catch 0' <<< "${resp}")"
       msg="$(jq -r 'try .msg  catch empty' <<< "${resp}")"
       if [[ "${code}" = "0" ]]; then
@@ -305,9 +288,9 @@ do_one_type() {
       fi
     fi
   else
-    # 记录不存在，新增
-    log "新增 ${rtype} ${SANITIZED_FQDN}=${ip}"
-    resp="$(add_record "${DOMAIN_ID}" "${SUBDOMAIN}" "${rtype}" "${ip}" "${LINE_ID}" "${TTL}")"
+    # 记录不存在 -> 新增
+    log "新增 ${rtype} ${SANITIZED_FQDN}=${ip_norm}"
+    resp="$(add_record "${domain_id}" "${sub}" "${rtype}" "${ip_norm}" "${LINE_ID}" "${TTL}")"
     code="$(jq -r 'try .code catch 0' <<< "${resp}")"
     msg="$(jq -r 'try .msg  catch empty' <<< "${resp}")"
     if [[ "${code}" = "0" ]]; then
@@ -320,21 +303,95 @@ do_one_type() {
   fi
 }
 
-# 分别处理 A/AAAA（按开关）
-if [[ "${ENABLE_IPV4}" == "true" ]]; then
-  do_one_type "A" "${IPV4}" || true
-else
-  log "未启用 IPv4(A) 更新，跳过"
-fi
+########################################
+# 主程序
+########################################
+main() {
+  log "===== dnsmgr-ddns 启动：${SANITIZED_FQDN} ====="
 
-if [[ "${ENABLE_IPV6}" == "true" ]]; then
-  do_one_type "AAAA" "${IPV6}" || true
-else
-  log "未启用 IPv6(AAAA) 更新，跳过"
-fi
+  if [[ "${ENABLE_IPV4}" != "true" && "${ENABLE_IPV6}" != "true" ]]; then
+    log "IPv4 与 IPv6 均被禁用，流程结束"
+    echo "IPv4 与 IPv6 均被禁用，未进行任何更新。"
+    exit 0
+  fi
 
-log "===== dnsmgr-ddns 完成：${SANITIZED_FQDN} ====="
-echo "DDNS 更新完成（详见 ${LOG_FILE}）。"
+  # 1) 找主域 & 子域
+  local domain_json DOMAIN_ID DOMAIN_NAME SUBDOMAIN
+  domain_json="$(find_domain "${SANITIZED_FQDN}")"
+  if [[ -z "${domain_json}" || "${domain_json}" == "null" ]]; then
+    log "错误：未找到 ${SANITIZED_FQDN} 对应的主域"
+    echo "未在可管理域名中找到 ${SANITIZED_FQDN} 对应主域，退出（详见日志）。" >&2
+    exit 1
+  fi
+
+  DOMAIN_ID="$(jq -r '.id'   <<< "${domain_json}")"
+  DOMAIN_NAME="$(jq -r '.name' <<< "${domain_json}")"
+  DOMAIN_NAME="$(trim "${DOMAIN_NAME}")"
+  DOMAIN_NAME="${DOMAIN_NAME%.}"
+  DOMAIN_NAME="${DOMAIN_NAME,,}"
+
+  if [[ -z "${DOMAIN_ID}" || -z "${DOMAIN_NAME}" || "${DOMAIN_NAME}" == "null" ]]; then
+    log "错误：domain_json 解析失败：${domain_json}"
+    echo "主域解析失败（详见日志）。" >&2
+    exit 1
+  fi
+
+  if [[ "${SANITIZED_FQDN}" == "${DOMAIN_NAME}" ]]; then
+    SUBDOMAIN="@"
+  else
+    SUBDOMAIN="${SANITIZED_FQDN%."${DOMAIN_NAME}"}"
+  fi
+  log "已解析主域：id=${DOMAIN_ID}, name=${DOMAIN_NAME}, sub=${SUBDOMAIN}"
+
+  # 2) TTL 不低于平台最小值
+  local min_ttl_str
+  min_ttl_str="$(get_domain_min_ttl "${DOMAIN_ID}")" || true
+  if [[ -n "${min_ttl_str}" && "${min_ttl_str}" =~ ^[0-9]+$ ]]; then
+    if (( TTL < min_ttl_str )); then
+      log "将 TTL 从 ${TTL} 调整为平台最小值 ${min_ttl_str}"
+      TTL="${min_ttl_str}"
+    fi
+  fi
+
+  # 3) 获取公网 IP
+  local IPV4="" IPV6=""
+  if [[ "${ENABLE_IPV4}" == "true" ]]; then
+    IPV4="$(trim "$(get_ipv4)")"
+    if is_ipv4 "${IPV4}"; then
+      log "检测到 IPv4：${IPV4}"
+    else
+      IPV4=""
+      log "未检测到 IPv4"
+    fi
+  else
+    log "已禁用 IPv4 处理，跳过"
+  fi
+
+  if [[ "${ENABLE_IPV6}" == "true" ]]; then
+    IPV6="$(trim "$(get_ipv6)")"
+    if is_ipv6 "${IPV6}"; then
+      log "检测到 IPv6：${IPV6}"
+    else
+      IPV6=""
+      log "未检测到 IPv6"
+    fi
+  else
+    log "已禁用 IPv6 处理，跳过"
+  fi
+
+  # 4) 更新（仅在变化时）
+  if [[ "${ENABLE_IPV4}" == "true" ]]; then
+    do_one_type "A" "${IPV4}" "${DOMAIN_ID}" "${SUBDOMAIN}" || true
+  fi
+  if [[ "${ENABLE_IPV6}" == "true" ]]; then
+    do_one_type "AAAA" "${IPV6}" "${DOMAIN_ID}" "${SUBDOMAIN}" || true
+  fi
+
+  log "===== dnsmgr-ddns 完成：${SANITIZED_FQDN} ====="
+  echo "DDNS 更新完成（详见 ${LOG_FILE}）。"
+}
+
+main "$@"
 
 ```
 
